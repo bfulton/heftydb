@@ -52,7 +52,8 @@ public class Key implements Comparable<Key> {
             return compared;
         }
 
-        return Long.compare(snapshotId, o.snapshotId);
+        return 0;
+        //return Long.compare(snapshotId, o.snapshotId);
     }
 
     @Override

@@ -19,6 +19,7 @@ package com.jordanwilliams.heftydb.offheap;
 import com.jordanwilliams.heftydb.data.Key;
 import com.jordanwilliams.heftydb.data.Value;
 import com.jordanwilliams.heftydb.util.Sizes;
+import com.jordanwilliams.heftydb.util.VarInts;
 import sun.misc.Unsafe;
 
 import java.nio.ByteBuffer;
@@ -67,9 +68,24 @@ public class SortedByteMap implements Offheap, Iterable<SortedByteMap.Entry> {
     public static class Builder {
 
         private final List<Entry> entries = new LinkedList<Entry>();
+        private ByteBuffer keyPrefix = null;
+        private int keyPrefixSize = 0;
 
         public void add(Key key, Value value) {
             entries.add(new Entry(key, value));
+            ByteBuffer keyData = key.data();
+            if (keyPrefix == null) {
+                keyPrefix = keyData.duplicate();
+                keyPrefixSize = keyData.remaining();
+            } else {
+                keyPrefixSize = Math.min(keyPrefixSize, keyData.remaining());
+                for (int i = 0; i < keyPrefixSize; i++) {
+                    if (keyPrefix.get(i) != keyData.get(i)) {
+                        keyPrefixSize = i;
+                        break;
+                    }
+                }
+            }
         }
 
         public SortedByteMap build() {
@@ -81,6 +97,8 @@ public class SortedByteMap implements Offheap, Iterable<SortedByteMap.Entry> {
             int memorySize = 0;
             int[] entryOffsets = new int[entries.size()];
 
+            memorySize += Sizes.INT_SIZE; //Key prefix size
+            memorySize += keyPrefixSize; //Key prefix
             memorySize += Sizes.INT_SIZE; //MemoryPointer count
             memorySize += Sizes.INT_SIZE * entries.size(); //Pointers
 
@@ -89,16 +107,23 @@ public class SortedByteMap implements Offheap, Iterable<SortedByteMap.Entry> {
 
             for (Entry entry : entries) {
                 entryOffsets[counter] = memorySize;
-                memorySize += Sizes.INT_SIZE;
-                memorySize += entry.key().size();
-                memorySize += Sizes.LONG_SIZE;
-                memorySize += Sizes.INT_SIZE;
+                int keySize = entry.key().size() - keyPrefixSize;
+                memorySize += VarInts.computeRawVarint32Size(keySize);
+                memorySize += keySize;
+                memorySize += VarInts.computeRawVarint64Size(entry.key().snapshotId());
+                memorySize += VarInts.computeRawVarint32Size(entry.value().size());
                 memorySize += entry.value().size();
                 counter++;
             }
 
             MemoryPointer pointer = MemoryAllocator.allocate(memorySize, PAGE_SIZE);
             ByteBuffer memoryBuffer = pointer.directBuffer();
+
+            //Key prefix
+            memoryBuffer.putInt(keyPrefixSize);
+            for (int i = 0; i < keyPrefixSize; i++) {
+                memoryBuffer.put(keyPrefix.get(i));
+            }
 
             //Pack pointers
             memoryBuffer.putInt(entries.size());
@@ -116,17 +141,18 @@ public class SortedByteMap implements Offheap, Iterable<SortedByteMap.Entry> {
                 value.data().rewind();
 
                 //Key
-                memoryBuffer.putInt(key.size());
+                int keySize = key.size() - keyPrefixSize;
+                VarInts.writeRawVarint32(memoryBuffer, keySize);
 
                 ByteBuffer keyData = key.data();
-                for (int i = 0; i < key.size(); i++) {
+                for (int i = keyPrefixSize; i < key.size(); i++) {
                     memoryBuffer.put(keyData.get(i));
                 }
 
-                memoryBuffer.putLong(key.snapshotId());
+                VarInts.writeRawVarint64(memoryBuffer, key.snapshotId());
 
                 //Value
-                memoryBuffer.putInt(value.size());
+                VarInts.writeRawVarint32(memoryBuffer, value.size());
 
                 ByteBuffer valueData = value.data();
                 for (int i = 0; i < value.size(); i++) {
@@ -204,13 +230,23 @@ public class SortedByteMap implements Offheap, Iterable<SortedByteMap.Entry> {
     }
 
     private final MemoryPointer pointer;
-    private final ByteBuffer directBuffer;
     private final int entryCount;
+    private final byte[] keyPrefix;
 
     public SortedByteMap(MemoryPointer pointer) {
         this.pointer = pointer;
-        this.directBuffer = pointer.directBuffer();
-        this.entryCount = unsafe.getInt(pointer.address());
+
+        long addr = pointer.address();
+        int keyPrefixSize = unsafe.getInt(addr);
+        addr += Sizes.INT_SIZE;
+
+        keyPrefix = new byte[keyPrefixSize];
+        for (int i = 0; i < keyPrefixSize; i++) {
+            keyPrefix[i] = unsafe.getByte(addr + i);
+        }
+        addr += keyPrefixSize;
+
+        this.entryCount = unsafe.getInt(addr);
     }
 
     public Entry get(int index) {
@@ -324,26 +360,27 @@ public class SortedByteMap implements Offheap, Iterable<SortedByteMap.Entry> {
         long startAddress = pointer.address();
 
         //Key
-        int keySize = unsafe.getInt(startAddress + entryOffset);
+        int keySize = VarInts.readRawVarint32(unsafe, startAddress + entryOffset);
 
-        ByteBuffer keyBuffer = ByteBuffer.allocate(keySize);
-        int keyOffset = entryOffset + Sizes.INT_SIZE;
+        ByteBuffer keyBuffer = ByteBuffer.allocate(keyPrefix.length + keySize);
+        keyBuffer.put(keyPrefix);
+        int keyOffset = entryOffset + VarInts.computeRawVarint32Size(keySize);
         byte[] keyArray = keyBuffer.array();
         long keyAddress = startAddress + keyOffset;
 
         for (int i = 0; i < keySize; i++) {
-            keyArray[i] = unsafe.getByte(keyAddress++);
+            keyArray[keyPrefix.length + i] = unsafe.getByte(keyAddress++);
         }
 
-        long snapshotId = unsafe.getLong(startAddress + keyOffset + keySize);
+        long snapshotId = VarInts.readRawVarint64(unsafe, startAddress + keyOffset + keySize);
 
         keyBuffer.rewind();
 
         //Value
-        int valueOffset = keyOffset + keySize + Sizes.LONG_SIZE;
-        int valueSize = directBuffer.getInt(valueOffset);
+        int valueOffset = keyOffset + keySize + VarInts.computeRawVarint64Size(snapshotId);
+        int valueSize = VarInts.readRawVarint32(unsafe, startAddress + valueOffset);
         ByteBuffer valueBuffer = ByteBuffer.allocate(valueSize);
-        valueOffset += Sizes.INT_SIZE;
+        valueOffset += VarInts.computeRawVarint32Size(valueSize);
         byte[] valueArray = valueBuffer.array();
         long valueAddress = startAddress + valueOffset;
 
@@ -360,8 +397,8 @@ public class SortedByteMap implements Offheap, Iterable<SortedByteMap.Entry> {
         int entryOffset = entryOffset(bufferKeyIndex);
         long startAddress = pointer.address();
 
-        int keySize = unsafe.getInt(startAddress + entryOffset);
-        entryOffset += Sizes.INT_SIZE;
+        int keySize = VarInts.readRawVarint32(unsafe, startAddress + entryOffset);
+        entryOffset += VarInts.computeRawVarint32Size(keySize);
 
         int bufferKeyRemaining = keySize;
         int compareKeyRemaining = compareKey.data().remaining();
@@ -370,6 +407,10 @@ public class SortedByteMap implements Offheap, Iterable<SortedByteMap.Entry> {
 
         //Compare key bytes
         for (int i = 0; i < compareCount; i++) {
+            /* TODO: enable unsigned key comparisons, may need to hit elsewhere also
+               int bufferKeyVal = 0xff & unsafe.getByte(startAddress + entryOffset + i);
+               int compareKeyVal = 0xff & compareKeyArray[i];
+             */
             byte bufferKeyVal = unsafe.getByte(startAddress + entryOffset + i);
             byte compareKeyVal = compareKeyArray[i];
             bufferKeyRemaining--;
@@ -390,7 +431,7 @@ public class SortedByteMap implements Offheap, Iterable<SortedByteMap.Entry> {
 
         //If key bytes are equal, compare snapshot ids
         if (remainingDifference == 0) {
-            long bufferSnapshotId = unsafe.getLong(startAddress + entryOffset + compareCount);
+            long bufferSnapshotId = VarInts.readRawVarint64(unsafe, startAddress + entryOffset + compareCount);
             return Long.compare(bufferSnapshotId, compareKey.snapshotId());
         }
 
@@ -398,6 +439,6 @@ public class SortedByteMap implements Offheap, Iterable<SortedByteMap.Entry> {
     }
 
     private int entryOffset(int index) {
-        return unsafe.getInt(pointer.address() + (Sizes.INT_SIZE + (index * Sizes.INT_SIZE)));
+        return unsafe.getInt(pointer.address() + (Sizes.INT_SIZE + keyPrefix.length + Sizes.INT_SIZE + (index * Sizes.INT_SIZE)));
     }
 }
