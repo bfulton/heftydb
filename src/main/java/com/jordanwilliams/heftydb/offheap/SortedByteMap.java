@@ -394,6 +394,33 @@ public class SortedByteMap implements Offheap, Iterable<SortedByteMap.Entry> {
     }
 
     private int compareKeys(Key compareKey, int bufferKeyIndex) {
+        ByteBuffer compareKeyBuffer = compareKey.data().duplicate();
+        compareKeyBuffer.rewind();
+
+        int compareKeyRemaining = compareKeyBuffer.remaining();
+        int compareCount = Math.min(keyPrefix.length, compareKeyRemaining);
+
+        //Compare key prefix bytes
+        for (int i = 0; i < compareCount; i++) {
+            /* TODO: enable unsigned key comparisons, may need to hit elsewhere also
+               int bufferKeyVal = 0xff & unsafe.getByte(startAddress + entryOffset + i);
+               int compareKeyVal = 0xff & compareKeyArray[i];
+             */
+            byte bufferKeyVal = keyPrefix[i];
+            byte compareKeyVal = compareKeyBuffer.get();
+            compareKeyRemaining--;
+
+            if (bufferKeyVal == compareKeyVal) {
+                continue;
+            }
+
+            if (bufferKeyVal < compareKeyVal) {
+                return -1;
+            }
+
+            return 1;
+        }
+
         int entryOffset = entryOffset(bufferKeyIndex);
         long startAddress = pointer.address();
 
@@ -401,9 +428,7 @@ public class SortedByteMap implements Offheap, Iterable<SortedByteMap.Entry> {
         entryOffset += VarInts.computeRawVarint32Size(keySize);
 
         int bufferKeyRemaining = keySize;
-        int compareKeyRemaining = compareKey.data().remaining();
-        int compareCount = Math.min(bufferKeyRemaining, compareKeyRemaining);
-        byte[] compareKeyArray = compareKey.data().array();
+        compareCount = Math.min(bufferKeyRemaining, compareKeyRemaining);
 
         //Compare key bytes
         for (int i = 0; i < compareCount; i++) {
@@ -412,7 +437,7 @@ public class SortedByteMap implements Offheap, Iterable<SortedByteMap.Entry> {
                int compareKeyVal = 0xff & compareKeyArray[i];
              */
             byte bufferKeyVal = unsafe.getByte(startAddress + entryOffset + i);
-            byte compareKeyVal = compareKeyArray[i];
+            byte compareKeyVal = compareKeyBuffer.get();
             bufferKeyRemaining--;
             compareKeyRemaining--;
 

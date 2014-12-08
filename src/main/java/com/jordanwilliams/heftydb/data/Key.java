@@ -46,14 +46,7 @@ public class Key implements Comparable<Key> {
 
     @Override
     public int compareTo(Key o) {
-        int compared = data.compareTo(o.data);
-
-        if (compared != 0) {
-            return compared;
-        }
-
-        return 0;
-        //return Long.compare(snapshotId, o.snapshotId);
+        return data.compareTo(o.data);
     }
 
     @Override
